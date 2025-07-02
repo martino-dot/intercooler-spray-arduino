@@ -67,3 +67,8 @@ When connected to the Arduino through the **programming USB port**, in serial co
 
 &nbsp;&nbsp;**d** - Reports current mode, time since last spray, and water status
 
+
+## 3D Models
+I've included the 3D model for the intercooler box and intercooler box cap. It is designed to fit an Arduino Due, a single 3.3v relay module, and a development board on top of the arduino. The Arduino should sit on the side with the text engraved, so the programming USB port can be accessed when this is installed.
+
+I WAS able to fit this box on top of the airbag control module in the center console of an 06 WRX, however I did not include the cap as it was a better fit without. Feel free to put this anywhere else.
