@@ -29,6 +29,8 @@ const uint32_t sprayInterval = 30000;   // ms
 const uint32_t lowWaterBlinkDuration = 10000; // ms
 const uint32_t startupDelay = 15000;  // ms delay before control
 
+const uint32_t waterStableTime = 1000;  // ms delay for water to "normalize"
+
 // === Modes ===
 enum Mode : uint8_t {
   MODE_OFF = 0,
@@ -41,12 +43,15 @@ Mode currentMode = MODE_OFF;
 Mode lastSavedMode = MODE_OFF;
 
 // === Button State ===
-bool lastButtonState = HIGH;
-uint32_t buttonPressStart = 0;
-bool buttonHeld = false;
+bool lastButtonState       = HIGH;
+uint32_t buttonPressStart  = 0;
+bool buttonHeld            = false;
 bool waitingForSecondClick = false;
-uint32_t lastClickTime = 0;
-uint8_t clickCount = 0;
+uint32_t lastClickTime     = 0;
+uint8_t clickCount         = 0;
+uint32_t lastDebounceTime  = 0;
+int      lastRawState      = HIGH;  
+int      debouncedState    = HIGH; 
 
 // === Spray State ===
 bool spraying = false;
@@ -60,6 +65,9 @@ uint32_t lastBlinkTime = 0;
 // === Low water warning ===
 bool lowWaterWarningActive = false;
 uint32_t lowWaterWarningStart = 0;
+int      lastRawWater     = HIGH;           // last raw reading from sensor
+int      lowWater   = HIGH;           // stable, debounced water level
+uint32_t lastWaterChange  = 0;              // timestamp when water raw changed
 
 // === Water Refill States ===
 bool lastLowWaterState = true; // Assume last was LOW at startup
@@ -96,15 +104,111 @@ void setup() {
   startupDone = false;
 }
 
+
+void handleButton(uint32_t now, int reading) {
+
+  // 1) track raw changes for debounce timing
+  if (reading != lastRawState) {
+    lastDebounceTime = now;
+  }
+
+  // 2) if stable beyond debounce interval, update debouncedState
+  if (now - lastDebounceTime > debounceDelay) {
+    if (reading != debouncedState) {
+      debouncedState = reading;
+
+      // on stable transition, handle press/release edges:
+      if (debouncedState == LOW) {
+        // falling edge: button pressed
+        buttonPressStart = now;
+        buttonHeld       = false;  // reset hold flag
+        // Serial.println("button pressed");
+      } else {
+        // rising edge: button released
+        if (!buttonHeld) {
+          // handle quick click here (advance mode, etc.)
+          //currentMode = (currentMode + 1) % NUM_MODES;
+          //lastSavedMode = currentMode;
+          //saveModeIfNeeded();
+          clickCount++;
+          if (!waitingForSecondClick) {
+            waitingForSecondClick = true;
+            lastClickTime = now;
+          }
+        } else {
+          // was held & then released: revert to saved mode
+          currentMode = lastSavedMode;
+          stopSpray();
+          Serial.println("button reverted");
+        }
+      }
+    }
+
+    // 3) check for hold event when stable LOW
+    if (debouncedState == LOW && !buttonHeld && (now - buttonPressStart >= holdThreshold)) {
+      buttonHeld  = true;
+      currentMode = MODE_FORCE;
+    }
+
+    // Handle clicks after delay
+    if (waitingForSecondClick && (now - lastClickTime > doubleClickMaxGap)) {
+      // Single click
+      if (clickCount == 1) {
+        if (currentMode == MODE_OFF) {
+          currentMode = MODE_BOOST;
+          flashPattern(1, 150, now);
+          saveModeIfNeeded();
+          print("mode boost");
+        } else if (currentMode == MODE_BOOST) {
+          currentMode = MODE_OFF;
+          flashPattern(3, 150, now);
+          saveModeIfNeeded();
+          print("mode off 1");
+        } else if (currentMode == MODE_INTERVAL) {
+          currentMode = MODE_OFF;
+          flashPattern(3, 150, now);
+          saveModeIfNeeded();
+          print("mode off 2");
+        }
+        clickCount = 0;
+        waitingForSecondClick = false;
+      } else if (clickCount == 2) {
+        // Only activate interval if no other mode active
+        if (currentMode == MODE_OFF) {
+          currentMode = MODE_INTERVAL;
+          flashPattern(2, 150, now);
+          saveModeIfNeeded();
+          print("mode interval");
+        }
+        clickCount = 0;
+        waitingForSecondClick = false;
+      }
+
+    }
+  }
+
+  // update raw state for next cycle
+  lastRawState = reading;
+}
+
+inline void print(const char *msg) {
+  Serial.println(msg);
+}
+inline void print(const String &msg) {
+  Serial.println(msg);
+}
+
 void loop() {
   checkSerialBeforeStartup();
   
   uint32_t now = millis();
 
+  bool rawWater = (digitalRead(lowLevelPin) != HIGH);     // LOW = low water (NC sensor)
+  debouncedWaterLevel(now, rawWater);
+
   // Startup delay
   if (!startupDone) {
     // During startup delay, flash based on water & mode
-    bool lowWater = (digitalRead(lowLevelPin) == HIGH);
     if (now - startupTime < startupDelay) {
       // Blink LED rapidly if low water
       if (lowWater) {
@@ -119,7 +223,7 @@ void loop() {
           digitalWrite(statusLEDPin, LOW);
         }
       }
-      digitalWrite(pumpRelayPin, LOW);
+      // digitalWrite(pumpRelayPin, LOW);
       return;
     }
     startupDone = true;
@@ -127,10 +231,8 @@ void loop() {
   }
 
   // Read sensors
-  bool lowWater = (digitalRead(lowLevelPin) == HIGH);     // HIGH = low water (NC sensor)
-  bool underBoost = (digitalRead(hobbSwitchPin) == HIGH); // HIGH = boost (NO switch)
-  bool buttonReading = digitalRead(toggleButton);
-  
+  bool underBoost = (digitalRead(hobbSwitchPin) == LOW); // LOW = boost (NO switch)
+  bool buttonReading = (digitalRead(toggleButton));
   lastLowWaterState = lowWater;
 
   // Handle button with debounce and multiple clicks
@@ -140,6 +242,8 @@ void loop() {
   if (lowWater && !lowWaterWarningActive && currentMode != MODE_OFF) {
     lowWaterWarningActive = true;
     lowWaterWarningStart = now;
+    currentMode = MODE_OFF;
+    saveModeIfNeeded();
     stopSpray();
   }
 
@@ -153,19 +257,17 @@ void loop() {
     // After 10s, turn off LED and modes
     if (now - lowWaterWarningStart >= lowWaterBlinkDuration) {
       digitalWrite(statusLEDPin, LOW);
-      currentMode = MODE_OFF;
-      saveModeIfNeeded();
+      // currentMode = MODE_OFF; (already called)
       lowWaterWarningActive = false;
     }
-    digitalWrite(pumpRelayPin, LOW);
+    stopSpray();
     return;
   }
 
   // Force spray mode overrides everything else
   if (currentMode == MODE_FORCE) {
     if (!lowWater) {
-      digitalWrite(pumpRelayPin, HIGH);
-      digitalWrite(statusLEDPin, HIGH);
+      startSpray(now);
     } else {
       flashLED(now, 200);
     }
@@ -181,8 +283,8 @@ void loop() {
       runIntervalMode(now);
       break;
     case MODE_OFF:
-    default:
       stopSpray();
+    default:
       break;
   }
   
@@ -191,77 +293,15 @@ void loop() {
   triggerCooldownSpray(now);
 }
 
-// --- Button handler ---
-void handleButton(uint32_t now, bool reading) {
-  static uint32_t lastDebounceTime = 0;
-
-  if (reading != lastButtonState) {
-    lastDebounceTime = now;
+// Debounce water-level sensor (1s buffer)
+void debouncedWaterLevel(uint32_t now, int raw) {
+  if (raw != lastRawWater) {
+    lastWaterChange = now;
+    lastRawWater    = raw;
   }
-
-  if ((now - lastDebounceTime) > debounceDelay) {
-    // Button pressed (active LOW)
-    if (reading == LOW && lastButtonState == HIGH) {
-      buttonPressStart = now;
-      buttonHeld = false;
-    }
-
-    // Button held
-    if (reading == LOW && !buttonHeld && (now - buttonPressStart >= holdThreshold)) {
-      buttonHeld = true;
-      
-      currentMode = MODE_FORCE;
-      // Do NOT save force mode to flash storage
-    }
-
-    // Button released
-    if (reading == HIGH && lastButtonState == LOW) {
-      if (!buttonHeld) {
-        // Count clicks for single/double click
-        clickCount++;
-        if (!waitingForSecondClick) {
-          waitingForSecondClick = true;
-          lastClickTime = now;
-        }
-      } else {
-        // Button was held, now released, revert to last saved mode
-        currentMode = lastSavedMode;
-        stopSpray();
-      }
-    }
-
-    // Handle clicks after delay
-    if (waitingForSecondClick && (now - lastClickTime > doubleClickMaxGap)) {
-      // Single click
-      if (clickCount == 1) {
-        if (currentMode == MODE_OFF) {
-          currentMode = MODE_BOOST;
-          flashPattern(1, 150, now);
-          saveModeIfNeeded();
-        } else if (currentMode == MODE_BOOST) {
-          currentMode = MODE_OFF;
-          flashPattern(3, 150, now);
-          saveModeIfNeeded();
-        } else if (currentMode == MODE_INTERVAL) {
-          currentMode = MODE_OFF;
-          flashPattern(3, 150, now);
-          saveModeIfNeeded();
-        }
-      }
-      // Double click
-      else if (clickCount == 2) {
-        // Only activate interval if no other mode active
-        if (currentMode == MODE_OFF) {
-          currentMode = MODE_INTERVAL;
-          flashPattern(2, 150, now);
-          saveModeIfNeeded();
-        }
-      }
-      clickCount = 0;
-      waitingForSecondClick = false;
-    }
+  if (now - lastWaterChange >= waterStableTime) {
+    lowWater = raw;
   }
-  lastButtonState = reading;
 }
 
 // --- Spray Modes ---
@@ -337,16 +377,10 @@ void flashPattern(uint8_t count, uint32_t interval, uint32_t now) {
 
 // --- Flash Storage Save ---
 void saveModeIfNeeded() {
-  if (currentMode == MODE_BOOST || currentMode == MODE_INTERVAL) {
+  if (currentMode == MODE_BOOST || currentMode == MODE_INTERVAL || currentMode == MODE_OFF) {
     if (currentMode != lastSavedMode) {
       dueFlashStorage.write(0, currentMode);
       lastSavedMode = currentMode;
-    }
-  } else {
-    // Do not save OFF or FORCE mode
-    if (lastSavedMode != MODE_OFF) {
-      dueFlashStorage.write(0, MODE_OFF);
-      lastSavedMode = MODE_OFF;
     }
   }
 }
@@ -368,7 +402,7 @@ void handleSerialDiagnostics() {
       Serial.println(" seconds");
 
       // Water status
-      bool lowWater = (digitalRead(lowLevelPin) == HIGH);
+      bool lowWater = lowWater;
       Serial.print("Water Level: ");
       Serial.println(lowWater ? "LOW" : "OK");
     }
@@ -414,8 +448,7 @@ void triggerCooldownSpray(uint32_t now) {
   if (currentMode != MODE_BOOST) return; // Skip cooldown spray if interval mode is on
 
   if (cooldownReady && !cooling && !lastLowWaterState) {
-    digitalWrite(pumpRelayPin, HIGH);
-    digitalWrite(statusLEDPin, HIGH);
+    startSpray(now);
     cooling = true;
     cooldownStart = now;
     cooldownReady = false;
@@ -424,15 +457,14 @@ void triggerCooldownSpray(uint32_t now) {
   }
 
   if (cooling && (now - cooldownStart >= sprayDuration)) {
-    digitalWrite(pumpRelayPin, LOW);
-    digitalWrite(statusLEDPin, LOW);
+    stopSpray();
     cooling = false;
   }
 }
 
 // === Refill Detection ===
 void checkRefillDetection(uint32_t now) {
-  bool currentLowWater = (digitalRead(lowLevelPin) == HIGH); // HIGH = low water
+  bool currentLowWater = lowWater;
 
   // Detect transition from LOW to OK
   if (lastLowWaterState && !currentLowWater) {
@@ -468,6 +500,9 @@ void checkSerialBeforeStartup() {
       delay(1000);
       digitalWrite(pumpRelayPin, LOW);
       Serial.println("Pump relay OFF");
+    } else if (cmd == 'w') {
+      Serial.print("Water Level: ");
+      Serial.println(lowWater ? "LOW" : "OK");
     } else if (cmd == 'l') {
       Serial.println("LED ON (test)");
       digitalWrite(statusLEDPin, HIGH);
@@ -476,7 +511,10 @@ void checkSerialBeforeStartup() {
       Serial.println("LED OFF");
     } else if (cmd == 'm') {
       Serial.println("Enter mode: 0=OFF, 1=BOOST, 2=INTERVAL");
-      while (!Serial.available());
+      unsigned long startMs = millis();
+      while (!Serial.available() && millis() - startMs < 10000) {
+        
+      }
       uint8_t newMode = Serial.parseInt();
       if (newMode <= 2) {
         currentMode = (Mode)newMode;
