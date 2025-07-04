@@ -63,9 +63,13 @@ When connected to the Arduino through the **programming USB port**, in serial co
 
 &nbsp;&nbsp;**l** - Status LED test (turns on LED for 1 second)
 
+&nbsp;&nbsp;**w** - Checks water level
+
 &nbsp;&nbsp;**m** - Lets you switch between modes (off, boost, and interval)
 
-&nbsp;&nbsp;**d** - Reports current mode, time since last spray, and water status
+&nbsp;&nbsp;**d** - Reports current mode, time since last spray, and water status (Available after startup delay)
+
+&nbsp;&nbsp;**r** - Restarts arduino
 
 
 ## 3D Models
