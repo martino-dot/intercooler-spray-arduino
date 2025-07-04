@@ -8,6 +8,7 @@
 //   - Status LED (ON when spraying, BLINKS when water low)
 
 #include <DueFlashStorage.h>
+#include <DueTimer.h> 
 DueFlashStorage dueFlashStorage;
 
 // === Pin Assignments ===
@@ -28,8 +29,10 @@ const uint32_t sprayInterval = 30000;   // ms
 
 const uint32_t lowWaterBlinkDuration = 10000; // ms
 const uint32_t startupDelay = 15000;  // ms delay before control
+const uint32_t lowLevelDelay = 3000; // ms
 
 const uint32_t waterStableTime = 1000;  // ms delay for water to "normalize"
+
 
 // === Modes ===
 enum Mode : uint8_t {
@@ -61,6 +64,11 @@ uint32_t lastSprayTime = 0;
 // === LED Blink State ===
 bool ledState = false;
 uint32_t lastBlinkTime = 0;
+volatile bool flashActive = false;
+volatile uint8_t flashCount = 0;
+volatile uint8_t flashTotal = 0;
+volatile uint32_t flashInterval = 0;
+volatile uint32_t lastFlashTime = 0;
 
 // === Low water warning ===
 bool lowWaterWarningActive = false;
@@ -83,7 +91,7 @@ void setup() {
   
   pinMode(lowLevelPin, INPUT_PULLUP);
   pinMode(toggleButton, INPUT_PULLUP);
-  pinMode(hobbSwitchPin, INPUT);
+  pinMode(hobbSwitchPin, INPUT_PULLUP);
   pinMode(pumpRelayPin, OUTPUT);
   pinMode(statusLEDPin, OUTPUT);
 
@@ -98,6 +106,15 @@ void setup() {
   } else {
     currentMode = MODE_OFF;
     lastSavedMode = MODE_OFF;
+  }
+
+  
+  
+  // Flash once for boost mode, twice for interval mode
+  if (currentMode == MODE_BOOST) {
+    startFlashPattern(1, 400);
+  } else if (currentMode == MODE_INTERVAL) {
+    startFlashPattern(2, 400);
   }
 
   startupTime = millis();
@@ -156,17 +173,17 @@ void handleButton(uint32_t now, int reading) {
       if (clickCount == 1) {
         if (currentMode == MODE_OFF) {
           currentMode = MODE_BOOST;
-          flashPattern(1, 150, now);
+          startFlashPattern(1, 250);
           saveModeIfNeeded();
           print("mode boost");
         } else if (currentMode == MODE_BOOST) {
           currentMode = MODE_OFF;
-          flashPattern(3, 150, now);
+          startFlashPattern(3, 250);
           saveModeIfNeeded();
           print("mode off 1");
         } else if (currentMode == MODE_INTERVAL) {
           currentMode = MODE_OFF;
-          flashPattern(3, 150, now);
+          startFlashPattern(3, 200);
           saveModeIfNeeded();
           print("mode off 2");
         }
@@ -176,7 +193,7 @@ void handleButton(uint32_t now, int reading) {
         // Only activate interval if no other mode active
         if (currentMode == MODE_OFF) {
           currentMode = MODE_INTERVAL;
-          flashPattern(2, 150, now);
+          startFlashPattern(2, 400);
           saveModeIfNeeded();
           print("mode interval");
         }
@@ -209,20 +226,12 @@ void loop() {
   // Startup delay
   if (!startupDone) {
     // During startup delay, flash based on water & mode
+
+    if ((now - startupTime >= lowLevelDelay) && lowWater) {
+      flashLED(now, 200);
+    }
+
     if (now - startupTime < startupDelay) {
-      // Blink LED rapidly if low water
-      if (lowWater) {
-        flashLED(now, 200);
-      } else {
-        // Flash once for boost mode, twice for interval mode
-        if (currentMode == MODE_BOOST) {
-          flashPattern(1, 400, now);
-        } else if (currentMode == MODE_INTERVAL) {
-          flashPattern(2, 400, now);
-        } else {
-          digitalWrite(statusLEDPin, LOW);
-        }
-      }
       // digitalWrite(pumpRelayPin, LOW);
       return;
     }
@@ -335,7 +344,10 @@ void startSpray(uint32_t now) {
 void stopSpray() {
   spraying = false;
   digitalWrite(pumpRelayPin, LOW);
-  digitalWrite(statusLEDPin, LOW);
+  if (!flashActive) {
+    digitalWrite(statusLEDPin, LOW);
+  }
+  
 }
 
 // --- LED Flash Patterns ---
@@ -349,31 +361,32 @@ void flashLED(uint32_t now, uint32_t interval) {
 
 // Flash LED pattern count times with given on/off interval
 // Called repeatedly from loop during startup or to signal mode
-void flashPattern(uint8_t count, uint32_t interval, uint32_t now) {
-  static uint8_t flashes = 0;
-  static uint32_t lastFlashTime = 0;
-  static bool flashing = false;
-  static uint8_t currentCount = 0;
+void startFlashPattern(uint8_t count, uint32_t interval) {
+  Timer3.stop();                // stop it first
+  Timer3.detachInterrupt();     // ensure it's clean
 
-  if (!flashing) {
-    flashing = true;
-    flashes = count * 2; // on + off per flash
-    currentCount = 0;
-    lastFlashTime = now;
-  }
+  flashTotal   = count * 2;  // on + off cycles
+  flashCount   = 0;
+  flashActive  = true;
+  ledState = false;
+  digitalWrite(statusLEDPin, LOW);
+  Timer3.setPeriod(interval * 1000UL)
+        .attachInterrupt(flashCallback)
+        .start();
+}
 
-  if (flashing && now - lastFlashTime >= interval) {
-    ledState = !ledState;
-    digitalWrite(statusLEDPin, ledState);
-    lastFlashTime = now;
-    currentCount++;
-
-    if (currentCount >= flashes) {
-      flashing = false;
-      digitalWrite(statusLEDPin, LOW);
-    }
+void flashCallback() {
+  if (!flashActive) return;
+  ledState = !ledState;
+  digitalWrite(statusLEDPin, ledState);
+  flashCount++;
+  if (flashCount >= flashTotal) {
+    flashActive = false;
+    Timer3.stop();
+    digitalWrite(statusLEDPin, LOW);
   }
 }
+
 
 // --- Flash Storage Save ---
 void saveModeIfNeeded() {
@@ -524,6 +537,10 @@ void checkSerialBeforeStartup() {
       } else {
         Serial.println("Invalid mode");
       }
+    } else if (cmd == 'r') {
+      Serial.println("Resetting!");
+      Serial.flush();
+      NVIC_SystemReset();
     }
   }
 }
